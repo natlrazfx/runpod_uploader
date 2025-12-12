@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
 )
 
 ENV_FILE = ".env"
-DONATE_URL = "https://www.airtm.me/natalia4xk3sygi"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # где лежит скрипт
+ENV_FILE = os.path.join(BASE_DIR, ".env")
 
 
 # ---------- CONFIG ----------
@@ -34,15 +35,18 @@ class S3Config:
 
 
 def load_config() -> S3Config:
-    load_dotenv(ENV_FILE)
+    # читаем .env рядом со скриптом, даже если VS Code запускает из другой директории
+    load_dotenv(ENV_FILE, override=False)
+
     return S3Config(
-        access_key=os.getenv("RUNPOD_S3_ACCESS_KEY", ""),
-        secret_key=os.getenv("RUNPOD_S3_SECRET_KEY", ""),
-        bucket=os.getenv("RUNPOD_BUCKET", ""),
-        endpoint=os.getenv("RUNPOD_ENDPOINT", "https://s3api-eu-cz-1.runpod.io"),
-        region=os.getenv("RUNPOD_REGION", "eu-cz-1"),
-        local_root=os.getenv("LOCAL_ROOT", ""),
+        access_key=os.getenv("RUNPOD_S3_ACCESS_KEY", "").strip(),
+        secret_key=os.getenv("RUNPOD_S3_SECRET_KEY", "").strip(),
+        bucket=os.getenv("RUNPOD_BUCKET", "").strip(),
+        endpoint=os.getenv("RUNPOD_ENDPOINT", "https://s3api-eu-cz-1.runpod.io").strip(),
+        region=os.getenv("RUNPOD_REGION", "eu-cz-1").strip(),
+        local_root=os.getenv("LOCAL_ROOT", "").strip().strip('"').strip("'"),
     )
+
 
 
 def save_config(cfg: S3Config):
@@ -75,38 +79,65 @@ class RunPodS3:
     def list_prefix(self, prefix: str):
         """Возвращает (dirs, files) для заданного префикса."""
         if prefix and not prefix.endswith("/"):
-            prefix = prefix + "/"
+            prefix += "/"
 
         paginator = self.client.get_paginator("list_objects_v2")
-        page_it = paginator.paginate(
+        pages = paginator.paginate(
             Bucket=self.cfg.bucket,
             Prefix=prefix,
             Delimiter="/",
         )
 
-        dirs, files = [], []
-        for page in page_it:
+        dirs = set()
+        files = []
+
+        for page in pages:
+            # --- 1. папки, возвращённые через CommonPrefixes
             for cp in page.get("CommonPrefixes", []):
-                name = cp["Prefix"][len(prefix):] if prefix else cp["Prefix"]
-                name = name.strip("/")
+                name = cp["Prefix"][len(prefix):].strip("/")
                 if name:
-                    dirs.append(name + "/")
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith("/") and key == prefix:
-                    continue
-                name = key[len(prefix):]
-                if not name:
-                    continue
-                files.append(
-                    {
-                        "Key": key,
-                        "Name": name,
-                        "Size": obj.get("Size", 0),
-                        "LastModified": obj.get("LastModified"),
-                    }
-                )
-        return dirs, files
+                    dirs.add(name + "/")
+
+            # --- 2. объекты (файлы + папки-маркеры)
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+
+            # пропускаем сам корневой префикс
+            if key == prefix:
+                continue
+
+            name = key[len(prefix):]
+            if not name:
+                continue
+
+            # --- ВАЖНО! "folder/" = папка, а не файл ---
+            if name.endswith("/"):
+                dirs.add(name)
+                continue  # НЕ добавлять в files
+
+            # если вдруг API вернул вложенный путь без delimiter, считаем его папкой
+            if "/" in name:
+                first = name.split("/", 1)[0].strip()
+                if first:
+                    dirs.add(first + "/")
+                continue
+
+            # runpod иногда возвращает пустой объект без слеша как «папку»
+            if obj.get("Size", 0) == 0 and "/" not in name and "." not in name:
+                dirs.add(name + "/")
+                continue
+
+            # обычный файл
+            files.append({
+                "Key": key,
+                "Name": name,
+                "Size": obj.get("Size", 0),
+                "LastModified": obj.get("LastModified"),
+            })
+
+        return sorted(dirs), files
+
+
 
     def object_exists(self, key: str) -> bool:
         try:
@@ -156,6 +187,16 @@ class RunPodS3:
             Key=new_key,
         )
         self.client.delete_object(Bucket=self.cfg.bucket, Key=old_key)
+
+    # <<< NEW: создание "папки" (префикса) в S3
+    def create_folder(self, key: str):
+        """
+        Создает пустой объект с ключом, оканчивающимся на '/',
+        чтобы он отображался как папка.
+        """
+        if not key.endswith("/"):
+            key = key + "/"
+        self.client.put_object(Bucket=self.cfg.bucket, Key=key)
 
 
 class ProgressTracker:
@@ -271,6 +312,26 @@ class RemoteBrowser(QWidget):
         if self.s3 is None:
             return
 
+        # если по текущему префиксу лежит файл, предложим конвертировать его в папку
+        raw_prefix = self.current_prefix.strip("/")
+        if raw_prefix and self.s3.object_exists(raw_prefix):
+            msg = QMessageBox.question(
+                self,
+                "Path is a file",
+                f"'{raw_prefix}' Convert it to the folder??\n",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if msg == QMessageBox.Yes:
+                try:
+                    self.s3.delete(raw_prefix)
+                    self.s3.create_folder(raw_prefix + "/")
+                except Exception as e:
+                    QMessageBox.critical(self, "Convert failed", str(e))
+                    return
+            else:
+                self.current_prefix = "/".join(p for p in raw_prefix.split("/")[:-1] if p)
+                return self.refresh()
+
         dirs, files = self.s3.list_prefix(self.current_prefix)
 
         self.table.setSortingEnabled(False)
@@ -370,11 +431,8 @@ class MainWindow(QMainWindow):
         # ----- левая панель: локальный компьютер -----
         self.local_model = QFileSystemModel()
 
-        root_path = (
-            self.cfg.local_root
-            if self.cfg.local_root and os.path.isdir(self.cfg.local_root)
-            else QDir.rootPath()
-        )
+        root_path = self._resolve_local_root(self.cfg.local_root)
+
 
         self.local_model.setRootPath(root_path)
 
@@ -435,6 +493,32 @@ class MainWindow(QMainWindow):
             self.edit_settings()
         else:
             self.remote_browser.refresh()
+
+    def _resolve_local_root(self, path: str) -> str:
+        """
+        Приводим LOCAL_ROOT к рабочему виду:
+        - разворачиваем ~
+        - нормализуем слеши
+        - если не существует, пробуем корень диска (D:/)
+        - если вообще ничего, берём QDir.rootPath()
+        """
+        if not path:
+            return QDir.rootPath()
+
+        path = os.path.expanduser(path)
+        path = os.path.normpath(path)
+
+        if os.path.isdir(path):
+            return path
+
+        # если путь типа D:\что-то, а папки нет – хотя бы диск открыть
+        drive, _ = os.path.splitdrive(path)
+        if drive:
+            drive_root = drive + os.path.sep
+            if os.path.isdir(drive_root):
+                return drive_root
+
+        return QDir.rootPath()
 
     # ----- стиль -----
     def apply_dark_style(self):
@@ -514,10 +598,21 @@ class MainWindow(QMainWindow):
         act_upload.triggered.connect(self.upload_from_local)
         tb.addAction(act_upload)
 
-        # Spacer, чтобы сдвинуть правые кнопки к правой панели
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        tb.addWidget(spacer)
+        # <<< NEW: блок для центральной ссылки RunPod
+        spacer_left = QWidget()
+        spacer_left.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer_left)
+
+        runpod_label = QLabel(
+            '<a style="color:#a6c8ff; font-weight:bold;" '
+            'href="https://console.runpod.io/deploy">RunPod Console</a>'
+        )
+        runpod_label.setOpenExternalLinks(True)
+        tb.addWidget(runpod_label)
+
+        spacer_right = QWidget()
+        spacer_right.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer_right)
 
         # Правый блок: операции над RunPod (правой панелью)
         act_download = QAction("← Download", self)
@@ -559,10 +654,12 @@ class MainWindow(QMainWindow):
         self.drive_combo.clear()
         drives = QDir.drives()
         idx_to_select = 0
+        root_norm = os.path.normcase(os.path.abspath(root_path)).rstrip("\\/")
         for i, d in enumerate(drives):
             path = d.absoluteFilePath()
             self.drive_combo.addItem(path)
-            if root_path.startswith(path):
+            drive_norm = os.path.normcase(os.path.abspath(path)).rstrip("\\/")
+            if root_norm.startswith(drive_norm):
                 idx_to_select = i
         self.drive_combo.setCurrentIndex(idx_to_select)
         self.drive_combo.blockSignals(False)
@@ -572,17 +669,15 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.cfg, self)
         dlg.setStyleSheet(self.styleSheet())  # тёмный стиль
         if dlg.exec() == QDialog.Accepted:
-            self.cfg = dlg.cfg
+            updated_cfg = dlg.cfg
+            updated_cfg.local_root = updated_cfg.local_root.strip().strip('"').strip("'")
+            self.cfg = updated_cfg
             save_config(self.cfg)
             try:
                 self.s3 = RunPodS3(self.cfg)
                 self.remote_browser.s3 = self.s3
                 # обновляем левый корень
-                root_path = (
-                    self.cfg.local_root
-                    if self.cfg.local_root and os.path.isdir(self.cfg.local_root)
-                    else QDir.rootPath()
-                )
+                root_path = self._resolve_local_root(self.cfg.local_root)
                 self.local_model.setRootPath(root_path)
                 self.local_view.setRootIndex(self.local_model.index(root_path))
                 self.init_drive_combo(root_path)
@@ -701,7 +796,43 @@ class MainWindow(QMainWindow):
             new_base = base + "_copy"
         return (folder + new_base).lstrip("/")
 
-    # ----- upload / download / delete / rename -----
+    # ----- upload / download / delete / rename / new folder -----
+
+    def ensure_remote_folder(self, prefix: str) -> bool:
+        """
+        Убеждаемся, что каждый уровень prefix не занят файлом.
+        Если файл встречается, предлагаем удалить и заменить его на папку.
+        """
+        if not prefix:
+            return True
+
+        parts = [p for p in prefix.strip("/").split("/") if p]
+        current = ""
+        for part in parts:
+            current = f"{current}/{part}" if current else part
+            # если существует как файл (без слеша) – конфликт
+            if self.s3.object_exists(current):
+                res = QMessageBox.question(
+                    self,
+                    "Path is a file",
+                    f"'{current}' существует как файл. Заменить на папку?\n"
+                    f"Файл будет удалён и заменён пустой папкой.",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if res != QMessageBox.Yes:
+                    return False
+                try:
+                    self.s3.delete(current)
+                except Exception as e:
+                    QMessageBox.critical(self, "Delete failed", str(e))
+                    return False
+            # пытаемся создать папку (если уже есть - S3 проигнорирует)
+            try:
+                self.s3.create_folder(current + "/")
+            except Exception:
+                pass
+
+        return True
 
     def upload_from_local(self):
         if self.s3 is None:
@@ -714,6 +845,8 @@ class MainWindow(QMainWindow):
             return
 
         base_prefix = self.remote_browser.current_prefix.strip("/")
+        if not self.ensure_remote_folder(base_prefix):
+            return
 
         for local_path in files:
             fname = os.path.basename(local_path)
