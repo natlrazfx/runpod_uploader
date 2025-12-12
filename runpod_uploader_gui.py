@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 import boto3
 from boto3.s3.transfer import TransferConfig
+from botocore.config import Config
 
 from PySide6.QtCore import Qt, QDir
 from PySide6.QtGui import QAction
@@ -67,14 +68,32 @@ def save_config(cfg: S3Config):
 class RunPodS3:
     def __init__(self, cfg: S3Config):
         self.cfg = cfg
+        self.read_timeout = self._int_env("RUNPOD_READ_TIMEOUT", 7200)   # allow long uploads (2h+)
+        self.connect_timeout = self._int_env("RUNPOD_CONNECT_TIMEOUT", 30)
         self.session = boto3.session.Session()
+        client_cfg = Config(
+            connect_timeout=self.connect_timeout,
+            read_timeout=self.read_timeout,
+            retries={"max_attempts": 10, "mode": "standard"},
+        )
         self.client = self.session.client(
             service_name="s3",
             aws_access_key_id=cfg.access_key,
             aws_secret_access_key=cfg.secret_key,
             endpoint_url=cfg.endpoint,
             region_name=cfg.region,
+            config=client_cfg,
         )
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        val = os.getenv(name)
+        if val is None:
+            return default
+        try:
+            return int(val)
+        except ValueError:
+            return default
 
     def list_prefix(self, prefix: str):
         """Возвращает (dirs, files) для заданного префикса."""
@@ -154,9 +173,13 @@ class RunPodS3:
             raise ValueError("Empty key")
         filesize = os.path.getsize(local_path) or 1
         tracker = ProgressTracker(filesize, progress_callback) if progress_callback else None
+        part_mb = max(self._int_env("RUNPOD_PART_SIZE_MB", 64), 8)  # larger parts => fewer parts to finalize
+        part_size = part_mb * 1024 * 1024
+        max_conc = max(self._int_env("RUNPOD_MAX_CONCURRENCY", 4), 1)
         config = TransferConfig(
-            multipart_chunksize=8 * 1024 * 1024,
-            multipart_threshold=8 * 1024 * 1024,
+            multipart_chunksize=part_size,
+            multipart_threshold=part_size,
+            max_concurrency=max_conc,
         )
         self.client.upload_file(
             Filename=local_path,
