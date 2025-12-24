@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QFileSystemModel, QToolBar, QInputDialog, QLineEdit,
     QMessageBox, QDialog, QFormLayout, QDialogButtonBox, QLineEdit as QLE,
     QLabel, QStatusBar, QProgressBar, QPushButton, QSizePolicy,
-    QAbstractItemView, QTableWidget, QTableWidgetItem, QComboBox
+    QAbstractItemView, QTableWidget, QTableWidgetItem, QComboBox, QFileDialog
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # script directory
@@ -601,6 +601,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("RunPod Uploader")
         self.resize(1200, 700)
+        if sys.platform == "darwin":
+            self.setUnifiedTitleAndToolBarOnMac(False)
 
         self.cfg = load_config()
         self.s3 = None
@@ -617,11 +619,9 @@ class MainWindow(QMainWindow):
         root_path = self._resolve_local_root(self.cfg.local_root)
 
 
-        self.local_model.setRootPath(root_path)
-
         self.local_view = QTreeView()
         self.local_view.setModel(self.local_model)
-        self.local_view.setRootIndex(self.local_model.index(root_path))
+        self.set_local_root(root_path)
         self.local_view.setSortingEnabled(True)
         self.local_view.sortByColumn(0, Qt.AscendingOrder)
         self.local_view.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -668,9 +668,6 @@ class MainWindow(QMainWindow):
 
         self.init_toolbar()
         self.apply_dark_style()
-
-        # Set drive combo based on root_path.
-        self.init_drive_combo(root_path)
 
         if not (self.cfg.access_key and self.cfg.secret_key and self.cfg.bucket):
             self.edit_settings()
@@ -727,6 +724,21 @@ class MainWindow(QMainWindow):
                 background-color: #262626;
                 spacing: 4px;
             }
+            QToolBar::separator {
+                background-color: #3a3a3a;
+                width: 1px;
+                margin: 4px 6px;
+            }
+            QToolBar QToolButton {
+                background-color: #e0e0e0;
+                color: #202020;
+                border: 1px solid #b0b0b0;
+                padding: 4px 8px;
+                border-radius: 4px;
+            }
+            QToolBar QToolButton:hover {
+                background-color: #d0d0d0;
+            }
             QStatusBar {
                 background-color: #262626;
                 color: #f0f0f0;
@@ -761,12 +773,22 @@ class MainWindow(QMainWindow):
     def init_toolbar(self):
         tb = QToolBar("Main")
         tb.setMovable(False)
+        tb.setStyleSheet("QToolBar { background-color: #262626; }")
         self.addToolBar(tb)
 
         # Settings
         act_settings = QAction("Settings", self)
         act_settings.triggered.connect(self.edit_settings)
         tb.addAction(act_settings)
+
+        tb.addSeparator()
+        act_local_up = QAction("Local Up", self)
+        act_local_up.triggered.connect(self.local_up)
+        tb.addAction(act_local_up)
+
+        act_local_pick = QAction("Local Folder", self)
+        act_local_pick.triggered.connect(self.pick_local_folder)
+        tb.addAction(act_local_pick)
 
         # Drive selector (Windows only).
         if os.name == "nt":
@@ -787,8 +809,9 @@ class MainWindow(QMainWindow):
         spacer_left.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer_left)
 
+        link_color = "#1f1f1f" if sys.platform == "darwin" else "#a6c8ff"
         runpod_label = QLabel(
-            '<a style="color:#a6c8ff; font-weight:bold;" '
+            f'<a style="color:{link_color}; font-weight:bold;" '
             'href="https://console.runpod.io/deploy">RunPod Console</a>'
         )
         runpod_label.setOpenExternalLinks(True)
@@ -816,11 +839,12 @@ class MainWindow(QMainWindow):
         tb.addAction(act_refresh)
 
         # Attribution line near the Donate button.
+        text_color = "#333333" if sys.platform == "darwin" else "#cccccc"
         info_label = QLabel(
-            '<span style="font-size:10px; color:#cccccc;">'
-            '<a style="color:#a6c8ff;" href="https://www.linkedin.com/in/natalia-raz-0b8329120/">Natalia Raz</a> &nbsp;|&nbsp; '
-            '<a style="color:#a6c8ff;" href="https://github.com/natlrazfx">GitHub</a> &nbsp;|&nbsp; '
-            '<a style="color:#a6c8ff;" href="https://vimeo.com/552106671">Vimeo</a>'
+            f'<span style="font-size:10px; color:{text_color};">'
+            f'<a style="color:{link_color};" href="https://www.linkedin.com/in/natalia-raz-0b8329120/">Natalia Raz</a> &nbsp;|&nbsp; '
+            f'<a style="color:{link_color};" href="https://github.com/natlrazfx">GitHub</a> &nbsp;|&nbsp; '
+            f'<a style="color:{link_color};" href="https://vimeo.com/552106671">Vimeo</a>'
             '</span>'
         )
         info_label.setOpenExternalLinks(True)
@@ -862,10 +886,7 @@ class MainWindow(QMainWindow):
                 self.s3 = RunPodS3(self.cfg)
                 self.remote_browser.s3 = self.s3
                 # Update local root.
-                root_path = self._resolve_local_root(self.cfg.local_root)
-                self.local_model.setRootPath(root_path)
-                self.local_view.setRootIndex(self.local_model.index(root_path))
-                self.init_drive_combo(root_path)
+                self.set_local_root(self.cfg.local_root)
                 self.remote_browser.current_prefix = ""
                 self.remote_browser.refresh_async()
                 self.status.showMessage("Settings updated", 4000)
@@ -881,8 +902,27 @@ class MainWindow(QMainWindow):
         path = self.drive_combo.itemText(idx)
         if not path:
             return
+        self.set_local_root(path)
+
+    def set_local_root(self, path: str):
+        path = self._resolve_local_root(path)
         self.local_model.setRootPath(path)
         self.local_view.setRootIndex(self.local_model.index(path))
+        self.init_drive_combo(path)
+
+    def local_up(self):
+        current_root = self.local_model.rootPath()
+        if not current_root:
+            return
+        qdir = QDir(current_root)
+        if qdir.cdUp():
+            self.set_local_root(qdir.absolutePath())
+
+    def pick_local_folder(self):
+        start_dir = self.local_model.rootPath() or QDir.homePath()
+        path = QFileDialog.getExistingDirectory(self, "Select local folder", start_dir)
+        if path:
+            self.set_local_root(path)
 
     def _progress_cb(self, percent: int):
         self.progress.setVisible(True)

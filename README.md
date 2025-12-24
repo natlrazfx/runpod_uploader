@@ -56,6 +56,11 @@ From the project folder:
 python runpod_uploader_gui.py
 ```
 
+Quick launchers (same name as the script):
+
+- macOS: double-click `runpod_uploader_gui.command` (make it executable once with `chmod +x runpod_uploader_gui.command`)
+- Windows: double-click `runpod_uploader_gui.bat`
+
 On first launch, the Settings dialog opens if credentials are missing.
 
 ## How to use the app
