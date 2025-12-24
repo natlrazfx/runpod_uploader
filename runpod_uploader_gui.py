@@ -10,7 +10,7 @@ import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 
-from PySide6.QtCore import Qt, QDir
+from PySide6.QtCore import Qt, QDir, QObject, Signal, QThread, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QWidget, QVBoxLayout, QTreeView,
@@ -367,6 +367,26 @@ class SettingsDialog(QDialog):
         super().accept()
 
 
+# ---------- ASYNC LISTING ----------
+
+class ListWorker(QObject):
+    finished = Signal(str, list, list)
+    error = Signal(str, str)
+
+    def __init__(self, s3: RunPodS3, prefix: str):
+        super().__init__()
+        self.s3 = s3
+        self.prefix = prefix
+
+    def run(self):
+        try:
+            dirs, files = self.s3.list_prefix(self.prefix)
+        except Exception as exc:
+            self.error.emit(self.prefix, str(exc))
+            return
+        self.finished.emit(self.prefix, dirs, files)
+
+
 # ---------- REMOTE BROWSER (TABLE) ----------
 
 class RemoteBrowser(QWidget):
@@ -376,6 +396,9 @@ class RemoteBrowser(QWidget):
         super().__init__(parent)
         self.s3 = s3
         self.current_prefix = ""  # e.g. 'ComfyUI/models/vae'
+        self._refresh_thread: QThread | None = None
+        self._refresh_worker: ListWorker | None = None
+        self._pending_refresh = False
 
         layout = QVBoxLayout(self)
         # Add a small left gap so it does not stick to the splitter.
@@ -411,32 +434,7 @@ class RemoteBrowser(QWidget):
             return f"{sz/1024:.2f} KB"
         return f"{sz} B"
 
-    def refresh(self):
-        if self.s3 is None:
-            return
-
-        # If the current prefix points to a file, offer to convert it to a folder.
-        raw_prefix = self.current_prefix.strip("/")
-        if raw_prefix and self.s3.object_exists(raw_prefix):
-            msg = QMessageBox.question(
-                self,
-                "Path is a file",
-                f"'{raw_prefix}' is a file. Convert it to a folder?\n",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if msg == QMessageBox.Yes:
-                try:
-                    self.s3.delete(raw_prefix)
-                    self.s3.create_folder(raw_prefix + "/")
-                except Exception as e:
-                    QMessageBox.critical(self, "Convert failed", str(e))
-                    return
-            else:
-                self.current_prefix = "/".join(p for p in raw_prefix.split("/")[:-1] if p)
-                return self.refresh()
-
-        dirs, files = self.s3.list_prefix(self.current_prefix)
-
+    def populate(self, dirs, files):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         row = 0
@@ -474,6 +472,88 @@ class RemoteBrowser(QWidget):
         self.table.resizeColumnToContents(0)
         self.table.resizeColumnToContents(1)
 
+    def _ensure_prefix_folder(self) -> tuple[bool, bool]:
+        # If the current prefix points to a file, offer to convert it to a folder.
+        raw_prefix = self.current_prefix.strip("/")
+        if not raw_prefix or self.s3 is None:
+            return True, False
+        if self.s3.object_exists(raw_prefix):
+            msg = QMessageBox.question(
+                self,
+                "Path is a file",
+                f"'{raw_prefix}' is a file. Convert it to a folder?\n",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if msg == QMessageBox.Yes:
+                try:
+                    self.s3.delete(raw_prefix)
+                    self.s3.create_folder(raw_prefix + "/")
+                except Exception as e:
+                    QMessageBox.critical(self, "Convert failed", str(e))
+                    return False, False
+            else:
+                self.current_prefix = "/".join(p for p in raw_prefix.split("/")[:-1] if p)
+                return True, True
+        return True, False
+
+    def refresh(self):
+        if self.s3 is None:
+            return
+        ok, changed = self._ensure_prefix_folder()
+        if not ok:
+            return
+        if changed:
+            return self.refresh()
+        dirs, files = self.s3.list_prefix(self.current_prefix)
+        self.populate(dirs, files)
+
+    def refresh_async(self):
+        if self.s3 is None:
+            return
+        if self._refresh_thread is not None:
+            self._pending_refresh = True
+            return
+        ok, changed = self._ensure_prefix_folder()
+        if not ok:
+            return
+        if changed:
+            return self.refresh_async()
+
+        self._pending_refresh = False
+        thread = QThread(self)
+        worker = ListWorker(self.s3, self.current_prefix)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_refresh_finished)
+        worker.error.connect(self._on_refresh_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_refresh_worker)
+
+        self._refresh_thread = thread
+        self._refresh_worker = worker
+        thread.start()
+
+    def _on_refresh_finished(self, prefix: str, dirs, files):
+        if prefix != self.current_prefix:
+            return
+        self.populate(dirs, files)
+
+    def _on_refresh_error(self, prefix: str, message: str):
+        if prefix != self.current_prefix:
+            return
+        QMessageBox.critical(self, "Error", f"Failed to list storage:\n{message}")
+
+    def _clear_refresh_worker(self):
+        self._refresh_thread = None
+        self._refresh_worker = None
+        if self._pending_refresh:
+            self._pending_refresh = False
+            self.refresh_async()
+
     def selected_entries(self):
         """Return a list of (name, type) for selected rows."""
         rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
@@ -507,11 +587,11 @@ class RemoteBrowser(QWidget):
                 parts = self.current_prefix.split("/")
                 parts = parts[:-1]
                 self.current_prefix = "/".join([p for p in parts if p])
-                self.refresh()
+                self.refresh_async()
         elif typ == "DIR":
             new_prefix = self.current_prefix + "/" + name.strip("/") if self.current_prefix else name.strip("/")
             self.current_prefix = new_prefix
-            self.refresh()
+            self.refresh_async()
 
 
 # ---------- MAIN WINDOW ----------
@@ -595,7 +675,7 @@ class MainWindow(QMainWindow):
         if not (self.cfg.access_key and self.cfg.secret_key and self.cfg.bucket):
             self.edit_settings()
         else:
-            self.remote_browser.refresh()
+            QTimer.singleShot(0, self.remote_browser.refresh_async)
 
     def _resolve_local_root(self, path: str) -> str:
         """
@@ -787,16 +867,13 @@ class MainWindow(QMainWindow):
                 self.local_view.setRootIndex(self.local_model.index(root_path))
                 self.init_drive_combo(root_path)
                 self.remote_browser.current_prefix = ""
-                self.remote_browser.refresh()
+                self.remote_browser.refresh_async()
                 self.status.showMessage("Settings updated", 4000)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to init S3 client:\n{e}")
 
     def remote_refresh(self):
-        try:
-            self.remote_browser.refresh()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to list storage:\n{e}")
+        self.remote_browser.refresh_async()
 
     def change_drive(self, idx: int):
         if idx < 0 or self.drive_combo is None:
@@ -988,7 +1065,7 @@ class MainWindow(QMainWindow):
                 return
 
         self.status.showMessage("Upload completed", 4000)
-        self.remote_browser.refresh()
+        self.remote_browser.refresh_async()
 
     def download_to_local(self):
         if self.s3 is None:
@@ -1069,7 +1146,7 @@ class MainWindow(QMainWindow):
                 return
 
         self.status.showMessage("Deleted", 3000)
-        self.remote_browser.refresh()
+        self.remote_browser.refresh_async()
 
     def rename_remote(self):
         if self.s3 is None:
@@ -1120,7 +1197,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Renaming {key} -> {new_key} ...")
             self.s3.rename(key, new_key)
             self.status.showMessage("Rename completed", 4000)
-            self.remote_browser.refresh()
+            self.remote_browser.refresh_async()
         except Exception as e:
             QMessageBox.critical(self, "Rename failed", str(e))
 
