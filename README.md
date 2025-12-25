@@ -123,8 +123,8 @@ RUNPOD_UPLOAD_FALLBACK_BUMP=0
 
 
 ## Don@tes
-**If any of this turns out to be useful for you - I’m glad.
-And if you feel like supporting it:
-☕ 1–2 coffees are more than enough ☺️**
+**If any of this turns out to be useful for you - I’m glad.  
+And if you feel like supporting it:  
+☕ 1–2 coffees are more than enough ☺️**  
 
 [Click to Buy me a Coffee](buymeacoffee.com/natlrazfx)**
