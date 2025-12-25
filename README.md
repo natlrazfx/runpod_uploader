@@ -2,6 +2,9 @@
 
 A simple cross-platform GUI for uploading and downloading files between your computer and RunPod S3-compatible storage.
 
+[![Watch the video](https://img.youtube.com/vi/4BUMfJ3zpeo/maxresdefault.jpg)](https://youtu.4BUMfJ3zpeo)
+
+
 ## What you need
 
 - Python 3.10+ (Windows or macOS)
