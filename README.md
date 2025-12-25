@@ -120,3 +120,11 @@ RUNPOD_UPLOAD_FALLBACK_BUMP=0
 
 - Do not share your `.env` file.
 - If a key is exposed, rotate it in the RunPod Console.
+
+
+## Don@tes
+**If any of this turns out to be useful for you - I’m glad.
+And if you feel like supporting it:
+☕ 1–2 coffees are more than enough ☺️**
+
+[Click to Buy me a Coffee](buymeacoffee.com/natlrazfx)**
