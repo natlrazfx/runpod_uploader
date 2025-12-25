@@ -45,8 +45,8 @@ def load_config() -> S3Config:
         access_key=os.getenv("RUNPOD_S3_ACCESS_KEY", "").strip(),
         secret_key=os.getenv("RUNPOD_S3_SECRET_KEY", "").strip(),
         bucket=os.getenv("RUNPOD_BUCKET", "").strip(),
-        endpoint=os.getenv("RUNPOD_ENDPOINT", "https://s3api-eu-cz-1.runpod.io").strip(),
-        region=os.getenv("RUNPOD_REGION", "eu-cz-1").strip(),
+        endpoint=os.getenv("RUNPOD_ENDPOINT", "").strip(),
+        region=os.getenv("RUNPOD_REGION", "").strip(),
         local_root=os.getenv("LOCAL_ROOT", "").strip().strip('"').strip("'"),
     )
 
