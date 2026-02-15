@@ -1,7 +1,9 @@
-#RunPod Uploader v1.2 Natalia Raz
+# RunPod Uploader v1.9 Natalia Raz
 
 import os
 import sys
+import subprocess
+import shutil
 import webbrowser
 from dataclasses import dataclass
 
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # script directory
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 COFFEE_URL = "https://buymeacoffee.com/natlrazfx"
+APP_VERSION = "v1.9"
 
 
 # ---------- CONFIG ----------
@@ -135,22 +138,70 @@ class RunPodS3:
             return True
         return default
 
+    def _iter_list_objects_pages(self, prefix: str, delimiter: str | None = None):
+        """
+        Resilient pagination for S3-compatible endpoints.
+        Some providers occasionally return a repeated continuation token.
+        """
+        token = None
+        start_after = None
+        seen_tokens = set()
+        seen_markers = set()
+        while True:
+            params = {
+                "Bucket": self.cfg.bucket,
+                "Prefix": prefix,
+            }
+            if delimiter:
+                params["Delimiter"] = delimiter
+            if token:
+                params["ContinuationToken"] = token
+            elif start_after:
+                params["StartAfter"] = start_after
+
+            page = self.client.list_objects_v2(**params)
+            yield page
+
+            if not page.get("IsTruncated"):
+                break
+
+            next_token = page.get("NextContinuationToken")
+            if not next_token or next_token in seen_tokens:
+                # Fallback path for buggy providers: continue by StartAfter marker.
+                markers = []
+                for obj in page.get("Contents", []):
+                    key = obj.get("Key")
+                    if key:
+                        markers.append(key)
+                for cp in page.get("CommonPrefixes", []):
+                    pfx = cp.get("Prefix")
+                    if pfx:
+                        markers.append(pfx)
+
+                if not markers:
+                    break
+
+                marker = max(markers)
+                if marker in seen_markers:
+                    break
+                seen_markers.add(marker)
+                token = None
+                start_after = marker
+                continue
+
+            seen_tokens.add(next_token)
+            token = next_token
+            start_after = None
+
     def list_prefix(self, prefix: str):
         """Return (dirs, files) for the given prefix."""
         if prefix and not prefix.endswith("/"):
             prefix += "/"
 
-        paginator = self.client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(
-            Bucket=self.cfg.bucket,
-            Prefix=prefix,
-            Delimiter="/",
-        )
-
         dirs = set()
         files = []
 
-        for page in pages:
+        for page in self._iter_list_objects_pages(prefix=prefix, delimiter="/"):
             # --- 1) folders returned via CommonPrefixes
             for cp in page.get("CommonPrefixes", []):
                 name = cp["Prefix"][len(prefix):].strip("/")
@@ -283,6 +334,49 @@ class RunPodS3:
 
     def delete(self, key: str):
         self.client.delete_object(Bucket=self.cfg.bucket, Key=key)
+
+    def list_all_keys(self, prefix: str) -> list[str]:
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        keys = []
+        for page in self._iter_list_objects_pages(prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj.get("Key")
+                if key:
+                    keys.append(key)
+        return keys
+
+    def list_tree_files(self, prefix: str) -> list[str]:
+        """
+        Recursively list only file keys under prefix by traversing folder levels.
+        Uses list_prefix() semantics, which are stable with RunPod listing behavior.
+        """
+        root = prefix.strip("/")
+        pending = [root]
+        visited = set()
+        file_keys = []
+
+        while pending:
+            current = pending.pop(0).strip("/")
+            if current in visited:
+                continue
+            visited.add(current)
+
+            dirs, files = self.list_prefix(current)
+            for f in files:
+                key = f.get("Key")
+                if key:
+                    file_keys.append(key)
+
+            for d in dirs:
+                dname = d.strip("/")
+                if not dname:
+                    continue
+                child = f"{current}/{dname}" if current else dname
+                if child not in visited:
+                    pending.append(child)
+
+        return file_keys
 
     def rename(self, old_key: str, new_key: str):
         self.client.copy_object(
@@ -599,7 +693,7 @@ class RemoteBrowser(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RunPod Uploader")
+        self.setWindowTitle(f"RunPod Uploader {APP_VERSION}")
         self.resize(1200, 700)
         if sys.platform == "darwin":
             self.setUnifiedTitleAndToolBarOnMac(False)
@@ -627,6 +721,7 @@ class MainWindow(QMainWindow):
         self.local_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.local_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.local_view.setEditTriggers(QTreeView.NoEditTriggers)
+        self.local_view.doubleClicked.connect(self.on_local_double_click)
 
         for col in range(1, 4):
             self.local_view.resizeColumnToContents(col)
@@ -790,6 +885,19 @@ class MainWindow(QMainWindow):
         act_local_pick.triggered.connect(self.pick_local_folder)
         tb.addAction(act_local_pick)
 
+        file_browser_name = "Finder" if sys.platform == "darwin" else "File Explorer" if os.name == "nt" else "File Browser"
+        act_local_open_root = QAction(f"Open in {file_browser_name}", self)
+        act_local_open_root.triggered.connect(self.open_local_root_in_file_browser)
+        tb.addAction(act_local_open_root)
+
+        act_local_open_selected = QAction("Open Selected", self)
+        act_local_open_selected.triggered.connect(self.open_selected_local_item)
+        tb.addAction(act_local_open_selected)
+
+        act_local_delete = QAction("Delete Local", self)
+        act_local_delete.triggered.connect(self.delete_local_items)
+        tb.addAction(act_local_delete)
+
         # Drive selector (Windows only).
         if os.name == "nt":
             tb.addSeparator()
@@ -924,6 +1032,82 @@ class MainWindow(QMainWindow):
         if path:
             self.set_local_root(path)
 
+    @staticmethod
+    def open_path_in_system(path: str) -> bool:
+        if not path:
+            return False
+        target = os.path.abspath(path)
+        if not os.path.exists(target):
+            return False
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            if os.name == "nt":
+                os.startfile(target)  # type: ignore[attr-defined]
+                return True
+            subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def reveal_path_in_file_browser(path: str) -> bool:
+        if not path:
+            return False
+        target = os.path.abspath(path)
+        if not os.path.exists(target):
+            return False
+        try:
+            if sys.platform == "darwin":
+                if os.path.isfile(target):
+                    subprocess.Popen(["open", "-R", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.Popen(["open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            if os.name == "nt":
+                if os.path.isfile(target):
+                    subprocess.Popen(["explorer", "/select,", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.Popen(["explorer", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            folder = target if os.path.isdir(target) else os.path.dirname(target)
+            subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            return False
+
+    def open_local_root_in_file_browser(self):
+        target = self.first_selected_local_path() or self.local_model.rootPath() or QDir.homePath()
+        if not self.reveal_path_in_file_browser(target):
+            QMessageBox.critical(self, "Open folder failed", f"Cannot open in file browser:\n{target}")
+
+    def first_selected_local_path(self) -> str | None:
+        sm = self.local_view.selectionModel()
+        if sm:
+            for idx in sm.selectedIndexes():
+                if idx.column() == 0:
+                    return self.local_model.filePath(idx)
+        current = self.local_view.currentIndex()
+        if current.isValid():
+            return self.local_model.filePath(current.siblingAtColumn(0))
+        return None
+
+    def open_selected_local_item(self):
+        path = self.first_selected_local_path()
+        if not path:
+            QMessageBox.information(self, "Open local item", "Select a file or folder on the left side first.")
+            return
+        if not self.open_path_in_system(path):
+            QMessageBox.critical(self, "Open failed", f"Cannot open:\n{path}")
+
+    def on_local_double_click(self, index):
+        if not index.isValid() or index.column() != 0:
+            return
+        path = self.local_model.filePath(index)
+        if os.path.isfile(path):
+            self.open_selected_local_item()
+
     def _progress_cb(self, percent: int):
         self.progress.setVisible(True)
         self.progress.setValue(percent)
@@ -963,6 +1147,56 @@ class MainWindow(QMainWindow):
             if os.path.isfile(path):
                 paths.add(path)
         return sorted(paths)
+
+    def selected_local_items(self) -> list[str]:
+        if not self.local_view.selectionModel():
+            return []
+        paths = set()
+        for idx in self.local_view.selectionModel().selectedIndexes():
+            if idx.column() != 0:
+                continue
+            path = self.local_model.filePath(idx)
+            if path:
+                paths.add(os.path.abspath(path))
+        if not paths:
+            current = self.local_view.currentIndex()
+            if current.isValid():
+                paths.add(os.path.abspath(self.local_model.filePath(current.siblingAtColumn(0))))
+        # Avoid duplicated recursive deletes: if parent dir selected, skip children.
+        ordered = sorted(paths, key=lambda p: (p.count(os.sep), len(p)))
+        filtered = []
+        for p in ordered:
+            if any(p == parent or p.startswith(parent + os.sep) for parent in filtered if os.path.isdir(parent)):
+                continue
+            filtered.append(p)
+        return filtered
+
+    def delete_local_items(self):
+        items = self.selected_local_items()
+        if not items:
+            QMessageBox.information(self, "Delete local", "Select one or more files/folders on the left side.")
+            return
+        names = "\n".join(items[:12])
+        if len(items) > 12:
+            names += f"\n... and {len(items) - 12} more"
+        reply = QMessageBox.question(
+            self,
+            "Delete local items",
+            f"Delete selected local items?\n\n{names}",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for path in items:
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                elif os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                QMessageBox.critical(self, "Delete failed", f"{path}\n\n{e}")
+                return
+        self.status.showMessage("Local items deleted", 4000)
 
     # ----- name conflict dialog -----
 
@@ -1114,45 +1348,96 @@ class MainWindow(QMainWindow):
 
         entries = self.remote_browser.selected_entries()
         if not entries:
-            QMessageBox.information(self, "Remote file", "Select one or more FILEs on the right side.")
+            QMessageBox.information(self, "Remote item", "Select one or more files/folders on the right side.")
             return
 
         target_dir = self.current_local_dir()
 
         for name, typ in entries:
-            if typ != "FILE":
-                continue
             key = self.remote_browser.full_key_for_name(name, typ)
-            if not key:
+            if not key or typ == "UP":
                 continue
-            local_path = os.path.join(target_dir, os.path.basename(name))
 
-            if os.path.exists(local_path):
-                action = self.ask_name_conflict("Download to local", local_path)
-                if action == "skip":
-                    continue
-                elif action == "copy":
-                    local_path = self.make_copy_name(local_path)
-                elif action == "rename":
-                    base = os.path.basename(local_path)
-                    new_name, ok = QInputDialog.getText(
-                        self, "Rename before download", "New file name:", QLineEdit.Normal, base
-                    )
-                    if not ok or not new_name.strip():
+            if typ == "FILE":
+                local_path = os.path.join(target_dir, os.path.basename(name))
+                if os.path.exists(local_path):
+                    action = self.ask_name_conflict("Download to local", local_path)
+                    if action == "skip":
                         continue
-                    new_name = new_name.strip()
-                    local_path = os.path.join(os.path.dirname(local_path), new_name)
-                # replace: overwrite in place
+                    elif action == "copy":
+                        local_path = self.make_copy_name(local_path)
+                    elif action == "rename":
+                        base = os.path.basename(local_path)
+                        new_name, ok = QInputDialog.getText(
+                            self, "Rename before download", "New file name:", QLineEdit.Normal, base
+                        )
+                        if not ok or not new_name.strip():
+                            continue
+                        new_name = new_name.strip()
+                        local_path = os.path.join(os.path.dirname(local_path), new_name)
+                    # replace: overwrite in place
 
-            try:
-                self.status.showMessage(f"Downloading {key} -> {local_path} ...")
-                self._progress_cb(0)
-                self.s3.download(key, local_path, progress_callback=self._progress_cb)
-                self.reset_progress()
-            except Exception as e:
-                self.reset_progress()
-                QMessageBox.critical(self, "Download failed", str(e))
-                return
+                try:
+                    self.status.showMessage(f"Downloading {key} -> {local_path} ...")
+                    self._progress_cb(0)
+                    self.s3.download(key, local_path, progress_callback=self._progress_cb)
+                    self.reset_progress()
+                except Exception as e:
+                    self.reset_progress()
+                    QMessageBox.critical(self, "Download failed", str(e))
+                    return
+                continue
+
+            if typ == "DIR":
+                dir_key = key.strip("/")
+                base_name = os.path.basename(dir_key)
+                local_base_dir = os.path.join(target_dir, base_name)
+                try:
+                    keys = self.s3.list_tree_files(dir_key)
+                except Exception as e:
+                    QMessageBox.critical(self, "Download failed", str(e))
+                    return
+
+                # Create target folder even if it has only nested folders/markers.
+                os.makedirs(local_base_dir, exist_ok=True)
+
+                prefix_with_slash = dir_key + "/"
+                for child_key in keys:
+                    if not child_key or child_key.endswith("/"):
+                        continue
+                    if child_key.startswith(prefix_with_slash):
+                        rel_path = child_key[len(prefix_with_slash):]
+                    else:
+                        rel_path = os.path.basename(child_key)
+                    local_path = os.path.join(local_base_dir, rel_path)
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+                    if os.path.exists(local_path):
+                        action = self.ask_name_conflict("Download folder to local", local_path)
+                        if action == "skip":
+                            continue
+                        elif action == "copy":
+                            local_path = self.make_copy_name(local_path)
+                        elif action == "rename":
+                            base = os.path.basename(local_path)
+                            new_name, ok = QInputDialog.getText(
+                                self, "Rename before download", "New file name:", QLineEdit.Normal, base
+                            )
+                            if not ok or not new_name.strip():
+                                continue
+                            new_name = new_name.strip()
+                            local_path = os.path.join(os.path.dirname(local_path), new_name)
+                        # replace: overwrite in place
+
+                    try:
+                        self.status.showMessage(f"Downloading {child_key} -> {local_path} ...")
+                        self._progress_cb(0)
+                        self.s3.download(child_key, local_path, progress_callback=self._progress_cb)
+                        self.reset_progress()
+                    except Exception as e:
+                        self.reset_progress()
+                        QMessageBox.critical(self, "Download failed", str(e))
+                        return
 
         self.status.showMessage("Download completed", 5000)
 
@@ -1163,7 +1448,7 @@ class MainWindow(QMainWindow):
 
         entries = self.remote_browser.selected_entries()
         if not entries:
-            QMessageBox.information(self, "Delete", "Select at least one file on the right side.")
+            QMessageBox.information(self, "Delete", "Select at least one file or folder on the right side.")
             return
 
         names = ", ".join(n for n, t in entries)
@@ -1180,7 +1465,15 @@ class MainWindow(QMainWindow):
             if not key:
                 continue
             try:
-                self.s3.delete(key)
+                if typ == "DIR":
+                    prefix = key.strip("/")
+                    keys = self.s3.list_all_keys(prefix)
+                    for child_key in keys:
+                        self.s3.delete(child_key)
+                    # Delete folder marker if present.
+                    self.s3.delete(prefix + "/")
+                elif typ == "FILE":
+                    self.s3.delete(key)
             except Exception as e:
                 QMessageBox.critical(self, "Delete failed", str(e))
                 return
@@ -1247,7 +1540,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     w = MainWindow()
-    w.show()
+    w.showMaximized()
     sys.exit(app.exec())
 
 

@@ -8,7 +8,12 @@ set "APP=%SCRIPT_DIR%runpod_uploader_gui.py"
 if exist "%VENV_PY%" (
   "%VENV_PY%" "%APP%"
 ) else (
-  python "%APP%"
+  where py >nul 2>nul
+  if %errorlevel%==0 (
+    py -3 "%APP%"
+  ) else (
+    python "%APP%"
+  )
 )
 
 endlocal
