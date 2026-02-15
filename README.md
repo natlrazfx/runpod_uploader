@@ -4,6 +4,25 @@ A simple cross-platform GUI for uploading and downloading files between your com
 
 [![Watch the video](https://img.youtube.com/vi/4BUMfJ3zpeo/maxresdefault.jpg)](https://youtu.4BUMfJ3zpeo)
 
+## What's New (v1.9)
+
+- Local panel improvements:
+  - Open selected local file/folder from the app
+  - Reveal selected path in Finder/File Explorer from the app toolbar
+  - Delete local files and folders
+- Remote panel improvements:
+  - Download full folders recursively (not only single files)
+  - Delete remote folders recursively
+- Stability:
+  - Improved S3 listing pagination for RunPod-compatible endpoints
+- UX:
+  - Window now opens maximized by default
+
+## Platform test status
+
+- Tested: macOS
+- Expected to work: Windows (launcher and runtime are prepared; final validation pending Windows test)
+
 
 ## What you need
 
@@ -81,19 +100,24 @@ Common actions:
 - If a name conflict exists, choose Replace, Make copy, Rename, or Skip.
 
 2) Download
-- Select one or more files (FILE) on the right.
+- Select one or more files or folders on the right.
 - Click **Download**.
-- Files download into the currently selected local folder.
+- Files/folders download into the currently selected local folder.
 
 3) Rename or Delete
 - Select a single FILE on the right, then **Rename**.
 - Select one or more items, then **Delete**.
 
-4) Navigate folders
+4) Local actions
+- Use **Open Selected** to open a local file/folder with the default OS app.
+- Use **Open in Finder** to reveal/open selected local path in file browser.
+- Use **Delete Local** to delete selected local files/folders.
+
+5) Navigate folders
 - Double-click a folder in the right panel to enter.
 - Double-click `..` to go up.
 
-5) Settings
+6) Settings
 - Use **Settings** to edit credentials or change the default local folder.
 
 Windows-only:
