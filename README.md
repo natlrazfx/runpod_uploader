@@ -4,17 +4,22 @@ A simple cross-platform GUI for uploading and downloading files between your com
 
 [![Watch the video](https://img.youtube.com/vi/4BUMfJ3zpeo/maxresdefault.jpg)](https://youtu.4BUMfJ3zpeo)
 
-## What's New (v1.9)
+## What's New (v1.10)
 
 - Local panel improvements:
   - Open selected local file/folder from the app
   - Reveal selected path in Finder/File Explorer from the app toolbar
   - Delete local files and folders
+  - Upload full local folders recursively, including empty folders
 - Remote panel improvements:
   - Download full folders recursively (not only single files)
   - Delete remote folders recursively
+  - Delete remote folders with S3 batch delete and clearer error reporting
+- Upload conflicts:
+  - When multiple files already exist on storage, choose **Replace all** or **Skip all**
 - Stability:
   - Improved S3 listing pagination for RunPod-compatible endpoints
+  - Remote delete also removes both `folder/` markers and zero-byte `folder` markers
 - UX:
   - Window now opens maximized by default
 
@@ -95,9 +100,9 @@ Layout:
 Common actions:
 
 1) Upload
-- Select one or more files on the left.
+- Select one or more files or folders on the left.
 - Click **Upload**.
-- If a name conflict exists, choose Replace, Make copy, Rename, or Skip.
+- If a name conflict exists, choose Replace, Replace all, Make copy, Rename, Skip, or Skip all.
 
 2) Download
 - Select one or more files or folders on the right.

@@ -1,4 +1,4 @@
-# RunPod Uploader v1.9 Natalia Raz
+# RunPod Uploader v1.10 Natalia Raz
 
 import os
 import sys
@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from PySide6.QtCore import Qt, QDir, QObject, Signal, QThread, QTimer
 from PySide6.QtGui import QAction
@@ -25,7 +26,7 @@ from PySide6.QtWidgets import (
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # script directory
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 COFFEE_URL = "https://buymeacoffee.com/natlrazfx"
-APP_VERSION = "v1.9"
+APP_VERSION = "v1.10"
 
 
 # ---------- CONFIG ----------
@@ -289,10 +290,12 @@ class RunPodS3:
         try:
             self.client.head_object(Bucket=self.cfg.bucket, Key=key)
             return True
-        except self.client.exceptions.NoSuchKey:
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False
             return False
         except Exception:
-            # Treat 404/403 and similar as missing.
             return False
 
     def upload(self, local_path: str, key: str, progress_callback=None):
@@ -335,6 +338,40 @@ class RunPodS3:
     def delete(self, key: str):
         self.client.delete_object(Bucket=self.cfg.bucket, Key=key)
 
+    def delete_many(self, keys: list[str]) -> list[str]:
+        unique_keys = []
+        seen = set()
+        for key in keys:
+            if key and key not in seen:
+                seen.add(key)
+                unique_keys.append(key)
+
+        errors = []
+        try:
+            for i in range(0, len(unique_keys), 1000):
+                chunk = unique_keys[i:i + 1000]
+                response = self.client.delete_objects(
+                    Bucket=self.cfg.bucket,
+                    Delete={"Objects": [{"Key": key} for key in chunk], "Quiet": True},
+                )
+                for err in response.get("Errors", []):
+                    key = err.get("Key", "")
+                    code = err.get("Code", "")
+                    msg = err.get("Message", "")
+                    errors.append(f"{key}: {code} {msg}".strip())
+            return errors
+        except ClientError:
+            # Some RunPod/S3-compatible endpoints redirect or reject DeleteObjects.
+            # Plain delete_object is slower but works more consistently.
+            pass
+
+        for key in unique_keys:
+            try:
+                self.delete(key)
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+        return errors
+
     def list_all_keys(self, prefix: str) -> list[str]:
         if prefix and not prefix.endswith("/"):
             prefix += "/"
@@ -345,6 +382,13 @@ class RunPodS3:
                 if key:
                     keys.append(key)
         return keys
+
+    def delete_tree(self, prefix: str) -> list[str]:
+        clean_prefix = prefix.strip("/")
+        keys = self.list_all_keys(clean_prefix)
+        # RunPod can show zero-byte "folder" objects without a trailing slash as folders.
+        keys.extend([clean_prefix, clean_prefix + "/"])
+        return self.delete_many(keys)
 
     def list_tree_files(self, prefix: str) -> list[str]:
         """
@@ -1200,29 +1244,39 @@ class MainWindow(QMainWindow):
 
     # ----- name conflict dialog -----
 
-    def ask_name_conflict(self, context: str, path: str) -> str:
+    def ask_name_conflict(self, context: str, path: str, allow_all: bool = False) -> str:
         """
         Returns one of:
-        'replace', 'copy', 'rename', 'skip'
+        'replace', 'replace_all', 'copy', 'rename', 'skip', 'skip_all'
         """
         msg = QMessageBox(self)
         msg.setWindowTitle("Name conflict")
         msg.setIcon(QMessageBox.Warning)
         msg.setText(f"{context}:\n{path}\n\nFile with this name already exists.")
         replace_btn = msg.addButton("Replace", QMessageBox.AcceptRole)
+        replace_all_btn = None
+        skip_all_btn = None
+        if allow_all:
+            replace_all_btn = msg.addButton("Replace all", QMessageBox.AcceptRole)
         copy_btn = msg.addButton("Make copy", QMessageBox.ActionRole)
         rename_btn = msg.addButton("Rename", QMessageBox.ActionRole)
         skip_btn = msg.addButton("Skip", QMessageBox.RejectRole)
+        if allow_all:
+            skip_all_btn = msg.addButton("Skip all", QMessageBox.RejectRole)
         msg.setDefaultButton(copy_btn)
         msg.exec()
 
         clicked = msg.clickedButton()
         if clicked == replace_btn:
             return "replace"
+        if allow_all and clicked == replace_all_btn:
+            return "replace_all"
         if clicked == copy_btn:
             return "copy"
         if clicked == rename_btn:
             return "rename"
+        if allow_all and clicked == skip_all_btn:
+            return "skip_all"
         return "skip"
 
     @staticmethod
@@ -1251,6 +1305,44 @@ class MainWindow(QMainWindow):
         else:
             new_base = base + "_copy"
         return (folder + new_base).lstrip("/")
+
+    @staticmethod
+    def build_upload_plan(local_items: list[str], base_prefix: str) -> tuple[list[tuple[str, str]], list[str]]:
+        upload_files = []
+        empty_dirs = []
+        base_prefix = base_prefix.strip("/")
+
+        for item in local_items:
+            if os.path.isfile(item):
+                key = f"{base_prefix}/{os.path.basename(item)}" if base_prefix else os.path.basename(item)
+                upload_files.append((item, key.lstrip("/")))
+                continue
+
+            if not os.path.isdir(item):
+                continue
+
+            root_name = os.path.basename(os.path.normpath(item))
+            found_file = False
+            found_dir = False
+            for dirpath, dirnames, filenames in os.walk(item):
+                rel_dir = os.path.relpath(dirpath, item)
+                rel_dir = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+                remote_dir = "/".join(p for p in [base_prefix, root_name, rel_dir] if p).strip("/")
+                found_dir = True
+
+                if not dirnames and not filenames:
+                    empty_dirs.append(remote_dir + "/")
+
+                for filename in filenames:
+                    found_file = True
+                    local_path = os.path.join(dirpath, filename)
+                    key = "/".join(p for p in [remote_dir, filename] if p).strip("/")
+                    upload_files.append((local_path, key))
+
+            if found_dir and not found_file:
+                empty_dirs.append("/".join(p for p in [base_prefix, root_name] if p).strip("/") + "/")
+
+        return upload_files, sorted(set(empty_dirs))
 
     # ----- upload / download / delete / rename / new folder -----
 
@@ -1295,25 +1387,57 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No config", "Configure RunPod S3 in Settings first.")
             return
 
-        files = self.selected_local_files()
-        if not files:
-            QMessageBox.information(self, "Local file", "Select one or more files on the left side.")
+        local_items = self.selected_local_items()
+        if not local_items:
+            QMessageBox.information(self, "Local item", "Select one or more files/folders on the left side.")
             return
 
         base_prefix = self.remote_browser.current_prefix.strip("/")
         if not self.ensure_remote_folder(base_prefix):
             return
 
-        for local_path in files:
+        upload_files, empty_dirs = self.build_upload_plan(local_items, base_prefix)
+        if not upload_files and not empty_dirs:
+            QMessageBox.information(self, "Upload", "Selected folders are empty or cannot be read.")
+            return
+
+        for folder_key in empty_dirs:
+            folder_prefix = folder_key.strip("/")
+            parent_prefix = "/".join(folder_prefix.split("/")[:-1])
+            if parent_prefix and not self.ensure_remote_folder(parent_prefix):
+                return
+            try:
+                self.s3.create_folder(folder_key)
+            except Exception as e:
+                QMessageBox.critical(self, "Upload folder failed", f"{folder_key}\n\n{e}")
+                return
+
+        replace_all = False
+        skip_all = False
+
+        for local_path, original_key in upload_files:
             fname = os.path.basename(local_path)
-            key = f"{base_prefix}/{fname}" if base_prefix else fname
-            key = key.lstrip("/")
+            key = original_key.lstrip("/")
+
+            folder_prefix = "/".join(key.split("/")[:-1])
+            if folder_prefix and not self.ensure_remote_folder(folder_prefix):
+                return
 
             # Conflict check.
             if self.s3.object_exists(key):
-                action = self.ask_name_conflict("Upload to RunPod", key)
-                if action == "skip":
+                if skip_all:
                     continue
+                if replace_all:
+                    action = "replace"
+                else:
+                    action = self.ask_name_conflict("Upload to RunPod", key, allow_all=True)
+                if action in ("skip", "skip_all"):
+                    if action == "skip_all":
+                        skip_all = True
+                    continue
+                elif action in ("replace", "replace_all"):
+                    if action == "replace_all":
+                        replace_all = True
                 elif action == "copy":
                     key = self.make_copy_key(key)
                 elif action == "rename":
@@ -1323,7 +1447,7 @@ class MainWindow(QMainWindow):
                     if not ok or not new_name.strip():
                         continue
                     new_name = new_name.strip()
-                    prefix = self.remote_browser.current_prefix.strip("/")
+                    prefix = "/".join(key.split("/")[:-1])
                     key = f"{prefix}/{new_name}" if prefix else new_name
                     key = key.lstrip("/")
                 # replace: overwrite in place
@@ -1451,7 +1575,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Delete", "Select at least one file or folder on the right side.")
             return
 
-        names = ", ".join(n for n, t in entries)
+        names = ", ".join(n for n, t in entries[:12])
+        if len(entries) > 12:
+            names += f", ... and {len(entries) - 12} more"
         reply = QMessageBox.question(
             self, "Delete files",
             f"Delete selected entries?\n{names}",
@@ -1467,15 +1593,21 @@ class MainWindow(QMainWindow):
             try:
                 if typ == "DIR":
                     prefix = key.strip("/")
-                    keys = self.s3.list_all_keys(prefix)
-                    for child_key in keys:
-                        self.s3.delete(child_key)
-                    # Delete folder marker if present.
-                    self.s3.delete(prefix + "/")
+                    errors = self.s3.delete_tree(prefix)
+                    if errors:
+                        preview = "\n".join(errors[:20])
+                        if len(errors) > 20:
+                            preview += f"\n... and {len(errors) - 20} more"
+                        QMessageBox.critical(
+                            self,
+                            "Delete failed",
+                            f"RunPod returned errors while deleting:\n\n{preview}",
+                        )
+                        return
                 elif typ == "FILE":
                     self.s3.delete(key)
             except Exception as e:
-                QMessageBox.critical(self, "Delete failed", str(e))
+                QMessageBox.critical(self, "Delete failed", f"{key}\n\n{e}")
                 return
 
         self.status.showMessage("Deleted", 3000)
